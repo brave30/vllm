@@ -1,0 +1,121 @@
+name: Validate KV load failure 69291
+
+on:
+  push:
+    branches: [codex/validate-kv-load-failure-69291]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: '3.14'
+      - name: Install lint tools
+        run: |
+          uv venv --python 3.14
+          uv pip install -r requirements/lint.txt
+          .venv/bin/pre-commit install
+      - name: Run pinned pre-commit hooks
+        run: >-
+          .venv/bin/pre-commit run --show-diff-on-failure --files
+          vllm/config/kv_transfer.py
+          vllm/v1/core/kv_cache_manager.py
+          vllm/v1/core/sched/scheduler.py
+          tests/v1/kv_connector/unit/utils.py
+          tests/v1/kv_connector/unit/test_example_connector.py
+          tests/v1/kv_connector/unit/test_invalid_blocks_correctness.py
+
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VLLM_TARGET_DEVICE: cpu
+      VLLM_USE_PRECOMPILED: '1'
+      VLLM_PRECOMPILED_WHEEL_VARIANT: cpu
+      VLLM_PRECOMPILED_WHEEL_COMMIT: f8b29fab414884206460fe63b983ca34fc6e3e9b
+      VLLM_CPU_KVCACHE_SPACE: '1'
+      VLLM_CPU_OMP_THREADS_BIND: nobind
+      OMP_NUM_THREADS: '2'
+      UV_NO_CACHE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: '3.14'
+      - name: Install CPU runtime and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnuma1 libtcmalloc-minimal4
+          uv venv --python 3.14
+          uv pip install --torch-backend cpu -r requirements/build/cpu.txt -r requirements/cpu.txt
+          uv pip install --torch-backend cpu --no-build-isolation -e .
+          uv pip install pytest pytest-asyncio pytest-timeout pytest-mock tblib scipy soundfile librosa
+          uv pip install --no-build-isolation -e tests/vllm_test_utils
+          iomp_path=$(find .venv -name libiomp5.so -print -quit)
+          echo "LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:$GITHUB_WORKSPACE/$iomp_path" >> "$GITHUB_ENV"
+          .venv/bin/python -c 'import torch, vllm; print(torch.__version__); print(vllm.__version__)'
+      - name: Restore base implementation while retaining regression tests
+        run: |
+          for path in vllm/config/kv_transfer.py vllm/v1/core/kv_cache_manager.py vllm/v1/core/sched/scheduler.py; do
+            git show ef687f6179b752c028767e610addbda67ed36d03:"$path" > "$path"
+          done
+      - name: Reproduce unit regression on base
+        run: |
+          set +e
+          .venv/bin/python -m pytest -q --junitxml=before-unit.xml tests/v1/kv_connector/unit/test_invalid_blocks_correctness.py -k test_sync_recompute_invalid_blocks_not_reused > before-unit.log 2>&1
+          result=$?
+          set -e
+          cat before-unit.log
+          test "$result" -eq 1
+          .venv/bin/python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('before-unit.xml').getroot()
+          failures = root.findall('.//testcase/failure')
+          assert not root.findall('.//testcase/error')
+          assert len(failures) == 3, len(failures)
+          assert all('assert 112 == 48' in failure.get('message', '') for failure in failures)
+          PY
+      - name: Reproduce serving regression on base
+        run: |
+          set +e
+          .venv/bin/python -m pytest -q --junitxml=before-serving.xml tests/v1/kv_connector/unit/test_example_connector.py::test_aborted_failed_sync_load_does_not_poison_next_request > before-serving.log 2>&1
+          result=$?
+          set -e
+          cat before-serving.log
+          test "$result" -eq 1
+          .venv/bin/python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('before-serving.xml').getroot()
+          failures = root.findall('.//testcase/failure')
+          assert not root.findall('.//testcase/error')
+          assert len(failures) == 1, len(failures)
+          assert 'assert output.num_cached_tokens == 0' in failures[0].text
+          PY
+      - name: Restore the fix
+        if: always()
+        run: git restore --source=HEAD -- vllm/config/kv_transfer.py vllm/v1/core/kv_cache_manager.py vllm/v1/core/sched/scheduler.py
+      - name: Run connector regression suites with the fix
+        run: >-
+          .venv/bin/python -m pytest -v --junitxml=after-unit.xml
+          tests/v1/kv_connector/unit/test_invalid_blocks_correctness.py
+          tests/v1/kv_connector/unit/test_kv_load_failure_recovery.py
+          tests/v1/kv_connector/unit/test_cache_pollution_prevention.py
+          tests/v1/kv_connector/unit/test_error_propagation.py
+      - name: Validate serving after the fix
+        run: >-
+          .venv/bin/python -m pytest -v --junitxml=after-serving.xml
+          tests/v1/kv_connector/unit/test_example_connector.py::test_aborted_failed_sync_load_does_not_poison_next_request
+
